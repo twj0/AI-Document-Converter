@@ -1,130 +1,158 @@
-# backend/app/api/v1/endpoints/conversion_tasks.py
+# backend/app/api/v1/endpoints/conversion_tasks.py (Final Asynchronous Version)
 
 import logging
 import shutil
 from pathlib import Path
-from uuid import UUID  # <--- FIXED: Import UUID here
+from uuid import UUID
 from fastapi import (
     APIRouter,
     UploadFile,
     File,
     HTTPException,
-    BackgroundTasks,
+    BackgroundTasks, # Kept for potential simple, non-Celery background tasks
     Form,
+    Depends,
 )
+from celery.result import AsyncResult
 
+# Import our data models, settings, and Celery app instance
 from ....core.config import settings
+from ....core.celery_app import celery_app
 from ....schemas.task import TaskCreated, TaskStatusResponse
-from ....services import file_processor, ai_service
+# Import the Celery tasks we created
+from ....tasks import non_ai_conversions, ai_conversions
 
+# --- Configure Logging ---
 logger = logging.getLogger(__name__)
 
+# --- Create APIRouter instance ---
 router = APIRouter()
 
-tasks_db = {}
+
+# --- Dependency for Celery App ---
+# This is not strictly necessary but can be useful for testing or more complex setups.
+def get_celery() -> Celery:
+    return celery_app
 
 
+# --- API Endpoint for File Upload (Now Asynchronous) ---
 @router.post("/upload", response_model=TaskCreated, status_code=202)
-def upload_and_convert_file(
+def upload_and_dispatch_task(
     task_type: str = Form(..., description="Type of conversion task. E.g., 'ppt_to_pdf', 'doc_to_markdown'."),
     subject: str = Form("General", description="Subject for AI-based conversions."),
     file: UploadFile = File(...)
 ):
-    task = TaskCreated()
-    task_id = task.id
-
+    """
+    Accepts a file and task parameters, saves the file, and dispatches a
+    background task for processing. Returns immediately with a task ID.
+    """
+    
+    # Generate a unique ID for this entire request.
+    request_id = UUID(uuid4()) # We'll use this for directory naming
+    
+    # 1. Save the uploaded file to a unique temporary directory.
     try:
-        task_temp_dir = settings.TEMP_FILE_DIR / str(task_id)
+        task_temp_dir = settings.TEMP_FILE_DIR / str(request_id)
         task_temp_dir.mkdir(parents=True, exist_ok=True)
         input_path = task_temp_dir / file.filename
-
-        logger.info(f"Task [{task_id}]: Saving uploaded file to {input_path}")
+        
+        logger.info(f"Request [{request_id}]: Saving uploaded file to {input_path}")
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
-        logger.error(f"Task [{task_id}]: Failed to save uploaded file. Error: {e}")
+        logger.error(f"Request [{request_id}]: Failed to save uploaded file. Error: {e}")
         raise HTTPException(status_code=500, detail="Could not save file.")
     finally:
         file.file.close()
 
-    tasks_db[task_id] = TaskStatusResponse(id=task_id, status="in_progress")
-    logger.info(f"Task [{task_id}]: Set status to 'in_progress'.")
-
+    # 2. **Dispatch the appropriate background task**
     try:
-        logger.info(f"Task [{task_id}]: Executing synchronous task: {task_type}")
-        output_file_path = None
-        structured_result = {} # Initialize for potential later use
+        logger.info(f"Request [{request_id}]: Dispatching task of type: {task_type}")
+        
+        # Define output directory based on the request ID
+        output_dir = settings.OUTPUT_FILE_DIR / str(request_id)
+        output_dir.mkdir(parents=True, exist_ok=True) # Celery task will expect this to exist
+
+        task_result: AsyncResult = None
 
         if task_type == "ppt_to_pdf":
-            output_dir = settings.OUTPUT_FILE_DIR / str(task_id)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_file_path = output_dir / f"{input_path.stem}.pdf"
-            file_processor.convert_to_pdf_com(input_path, output_file_path)
+            output_path = output_dir / f"{input_path.stem}.pdf"
+            # Dispatch the non-AI task
+            task_result = non_ai_conversions.ppt_to_pdf_task.delay(
+                input_path_str=str(input_path),
+                output_path_str=str(output_path)
+            )
 
         elif task_type in ["doc_to_markdown", "docx_to_markdown", "pdf_to_markdown"]:
-            output_dir = settings.OUTPUT_FILE_DIR / str(task_id)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_file_path = output_dir / f"{input_path.stem}.md"
-
-            text = ""
-            if input_path.suffix.lower() == ".doc":
-                text = file_processor.extract_text_from_doc(input_path)
-            elif input_path.suffix.lower() == ".docx":
-                text = file_processor.extract_text_from_docx(input_path)
-            elif input_path.suffix.lower() == ".pdf":
-                text = file_processor.extract_text_from_pdf(input_path)
-            else:
-                raise ValueError(f"Unsupported file type for this task: {input_path.suffix}")
-
-            if not text.strip():
-                 raise ValueError("Extracted text is empty, cannot proceed with AI conversion.")
-
-            # You MUST have your chosen provider's API key set in .env for this to work.
+            output_path = output_dir / f"{input_path.stem}.md"
+            
+            # Get the correct API key and model name for the selected provider
             api_key = getattr(settings, f"{settings.AI_PROVIDER.upper()}_API_KEY", None)
             model_name = getattr(settings, f"{settings.AI_PROVIDER.upper()}_MODEL_NAME", None)
 
             if not api_key:
-                raise ValueError(f"API Key for provider '{settings.AI_PROVIDER}' is not configured.")
-
-            ai_provider = ai_service.get_ai_provider(
-                provider_name=settings.AI_PROVIDER,
-                model_name=model_name,
-                api_key=api_key
-            )
-            structured_result = ai_provider.generate_structured_markdown(
-                text_content=text,
-                subject=subject,
-                file_type=input_path.suffix.upper()
-            )
-            markdown_content = structured_result.get("markdown_content", "")
+                raise HTTPException(status_code=400, detail=f"API Key for provider '{settings.AI_PROVIDER}' is not configured on the server.")
             
-            with open(output_file_path, "w", encoding="utf-8") as f:
-                f.write(markdown_content)
+            # Dispatch the AI task
+            task_result = ai_conversions.ai_conversion_task.delay(
+                input_path_str=str(input_path),
+                output_path_str=str(output_path),
+                subject=subject,
+                provider_name=settings.AI_PROVIDER,
+                api_key=api_key,
+                model_name=model_name
+            )
         else:
-            raise ValueError(f"Unknown task type: {task_type}")
+            raise HTTPException(status_code=400, detail=f"Unknown task type: {task_type}")
 
-        success_result = {
-            "output_file_url": f"/downloads/{task_id}/{output_file_path.name}",
-            "source_filename": file.filename,
-            "warnings": structured_result.get("warnings", [])
-        }
-        tasks_db[task_id] = TaskStatusResponse(id=task_id, status="success", result=success_result)
-        logger.info(f"Task [{task_id}]: Task completed successfully.")
+        # Get the task ID generated by Celery
+        task_id = UUID(task_result.id)
+        logger.info(f"Request [{request_id}]: Task dispatched successfully with Celery ID [{task_id}]")
 
     except Exception as e:
-        logger.error(f"Task [{task_id}]: An error occurred during processing. Error: {e}", exc_info=True)
-        tasks_db[task_id] = TaskStatusResponse(
-            id=task_id,
-            status="failed",
-            result={"error_message": str(e), "source_filename": file.filename}
-        )
+        logger.error(f"Request [{request_id}]: Failed to dispatch task. Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create background task. Reason: {e}")
 
-    return task
+    # Return the TaskCreated response with the Celery task ID
+    return TaskCreated(id=task_id)
 
 
+# --- API Endpoint for Status Polling (Now checks Celery backend) ---
 @router.get("/status/{task_id}", response_model=TaskStatusResponse)
-def get_task_status(task_id: UUID): # Use UUID directly here for automatic validation
-    task = tasks_db.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return task
+def get_task_status(task_id: UUID):
+    """
+    Polls for the status of a previously created Celery task.
+    """
+    logger.debug(f"Checking status for task ID: {task_id}")
+    task_result = AsyncResult(str(task_id), app=celery_app)
+
+    status = task_result.status.lower()
+    result = None
+
+    if task_result.successful():
+        status = "success"
+        # The result of our task function is a dictionary
+        task_output = task_result.get()
+        # We can enrich this result with more data if needed
+        output_path = Path(task_output.get("output_path", ""))
+        result = {
+            "output_file_url": f"/downloads/{task_id}/{output_path.name}",
+            "message": task_output.get("message"),
+            "warnings": task_output.get("warnings", [])
+        }
+
+    elif task_result.failed():
+        status = "failed"
+        # Celery stores the exception trace as the result for failed tasks
+        task_output = task_result.get()
+        result = {
+             "error_message": str(task_output.get("message", "An unknown error occurred."))
+        }
+    
+    # For pending or in_progress states, result remains None
+    elif status == "pending": # Task is waiting for a worker
+        pass 
+    elif status == "started" or status == "retry": # Task is running
+        status = "in_progress"
+
+    return TaskStatusResponse(id=task_id, status=status, result=result)
