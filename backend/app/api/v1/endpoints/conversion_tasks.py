@@ -21,6 +21,7 @@ from ....core.celery_app import celery_app
 from ....schemas.task import TaskCreated, TaskStatusResponse
 # Import the Celery tasks we created
 from ....tasks import non_ai_conversions, ai_conversions
+from celery import Celery
 
 # --- Configure Logging ---
 logger = logging.getLogger(__name__)
