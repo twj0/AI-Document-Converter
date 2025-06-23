@@ -3,6 +3,7 @@
 import logging
 from fastapi import FastAPI
 from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
 
 # Import the centralized settings object
 from .core.config import settings
@@ -26,6 +27,17 @@ app = FastAPI(
     # You can add more metadata here
     # # The openapi_url is the path to the auto-generated API schema
     openapi_url=f"{settings.API_V1_STR}/openapi.json"
+)
+
+# --- 2. Add CORS Middleware ---
+# This is the new block of code that enables Cross-Origin requests.
+# It tells the backend to allow requests from our frontend development server.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"], # The address of our frontend
+    allow_credentials=True,
+    allow_methods=["*"], # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"], # Allow all headers
 )
 
 
