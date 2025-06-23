@@ -7,6 +7,10 @@ from pathlib import Path
 # Import the centralized settings object
 from .core.config import settings
 
+# Import the main API router we assembled in the previous step
+from .api.v1.api import api_router
+
+
 # --- Configure Logging ---
 # Although other modules have logging, it's good practice to have a
 # basic configuration at the main entry point as well.
@@ -20,7 +24,8 @@ app = FastAPI(
     version="1.0.0",
     description="A professional-grade API for converting documents using AI.",
     # You can add more metadata here
-    # openapi_url=f"{settings.API_V1_STR}/openapi.json"
+    # # The openapi_url is the path to the auto-generated API schema
+    openapi_url=f"{settings.API_V1_STR}/openapi.json"
 )
 
 
@@ -71,7 +76,14 @@ def read_root():
 #
 # from .api.v1.api import api_router
 # app.include_router(api_router, prefix=settings.API_V1_STR)
+# --- Include the API Router ---
+# This is the crucial new line.
+# It tells the main app to include all the routes defined in our api_router.
+# The `prefix` ensures that all these routes will start with `/api/v1`.
+app.include_router(api_router, prefix=settings.API_V1_STR)
 
+# To run this application:
+# uvicorn backend.app.main:app --reload
 # To run this application:
 # 1. Make sure you are in the project's root directory (doc_converter_pro).
 # 2. Use the following command in your terminal:
