@@ -1,102 +1,126 @@
-# backend/app/main.py
+# backend/app/main.py (The Monolithic, Guaranteed Fix)
 
 import logging
-from fastapi import FastAPI
+import shutil
 from pathlib import Path
-from fastapi.middleware.cors import CORSMiddleware
+from uuid import uuid4, UUID
+from fastapi import FastAPI, Request, HTTPException, Depends
+from starlette.middleware.cors import CORSMiddleware
+from celery import Celery
+from celery.result import AsyncResult
 
-# Import the centralized settings object
+# All necessary imports are now in this single file
 from .core.config import settings
+from .core.celery_app import celery_app
+from .schemas.task import TaskCreated, TaskStatusResponse
+from .tasks import non_ai_conversions, ai_conversions
 
-# Import the main API router we assembled in the previous step
-from .api.v1.api import api_router
-
-
-# --- Configure Logging ---
-# Although other modules have logging, it's good practice to have a
-# basic configuration at the main entry point as well.
+# --- Basic Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Create FastAPI Application Instance ---
-# The title and version are loaded from our settings object, which centralizes configuration.
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version="1.0.0",
     description="A professional-grade API for converting documents using AI.",
-    # You can add more metadata here
-    # # The openapi_url is the path to the auto-generated API schema
-    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+    openapi_url="/api/v1/openapi.json"
 )
 
-# --- 2. Add CORS Middleware ---
-# This is the new block of code that enables Cross-Origin requests.
-# It tells the backend to allow requests from our frontend development server.
+# --- Middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # The address of our frontend
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
-    allow_methods=["*"], # Allow all methods (GET, POST, etc.)
-    allow_headers=["*"], # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
-# --- Event Handler: on_startup ---
-# This is a good place for tasks that need to run once when the server starts.
+# --- Startup Event ---
 @app.on_event("startup")
 def on_startup():
-    """
-    Perform application startup activities.
-    """
     logger.info("--- Starting up the application ---")
-    
-    # Ensure necessary directories exist
-    # We use the paths defined in our centralized settings.
-    temp_dir = Path(settings.TEMP_FILE_DIR)
-    output_dir = Path(settings.OUTPUT_FILE_DIR)
-    
-    try:
-        logger.info(f"Ensuring temporary directory exists: {temp_dir}")
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"Ensuring output directory exists: {output_dir}")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info("All necessary directories are ready.")
-    except Exception as e:
-        logger.critical(f"FATAL: Could not create necessary directories. Error: {e}")
-        # In a real production scenario, you might want the app to exit if it can't create dirs.
-        # For now, we log a critical error.
-        
-    logger.info(f"Application '{settings.PROJECT_NAME}' startup complete.")
+    Path(settings.TEMP_FILE_DIR).mkdir(parents=True, exist_ok=True)
+    Path(settings.OUTPUT_FILE_DIR).mkdir(parents=True, exist_ok=True)
+    logger.info("Application startup complete.")
 
+# --- API Endpoints defined DIRECTLY on the app ---
 
-# --- Root Endpoint ---
-# This is a simple health check endpoint to verify that the server is running.
 @app.get("/", tags=["Health Check"])
 def read_root():
+    return {"message": f"Welcome to {settings.PROJECT_NAME}."}
+
+@app.post("/api/v1/tasks/upload", response_model=TaskCreated, status_code=202, tags=["Conversion Tasks"])
+async def upload_and_dispatch_task(request: Request):
     """
-    A simple health check endpoint.
-    Returns a welcome message indicating the API is operational.
+    Accepts multipart/form-data, saves the file, and dispatches a background task.
+    This version is registered directly on the main app to bypass router bugs.
     """
-    return {"message": f"Welcome to {settings.PROJECT_NAME}. The API is running."}
+    try:
+        form_data = await request.form()
+        file = form_data.get("file")
+        task_type = form_data.get("task_type")
+        subject = form_data.get("subject", "General")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid form data.")
+
+    if not file or not task_type:
+        raise HTTPException(status_code=422, detail="Missing 'file' or 'task_type'.")
+
+    request_id = uuid4()
+    
+    try:
+        task_temp_dir = settings.TEMP_FILE_DIR / str(request_id)
+        task_temp_dir.mkdir(parents=True, exist_ok=True)
+        input_path = task_temp_dir / file.filename
+        
+        file_content = await file.read()
+        with open(input_path, "wb") as buffer:
+            buffer.write(file_content)
+    finally:
+        await file.close()
+
+    output_dir = settings.OUTPUT_FILE_DIR / str(request_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    task_result: AsyncResult = None
+
+    if task_type == "ppt_to_pdf":
+        output_path = output_dir / f"{input_path.stem}.pdf"
+        task_result = non_ai_conversions.ppt_to_pdf_task.delay(str(input_path), str(output_path))
+    elif task_type in ["doc_to_markdown", "docx_to_markdown", "pdf_to_markdown"]:
+        output_path = output_dir / f"{input_path.stem}.md"
+        api_key = getattr(settings, f"{settings.AI_PROVIDER.upper()}_API_KEY", None)
+        model_name = getattr(settings, f"{settings.AI_PROVIDER.upper()}_MODEL_NAME", None)
+        if not api_key:
+            raise HTTPException(status_code=400, detail=f"API Key for provider '{settings.AI_PROVIDER}' not set.")
+        task_result = ai_conversions.ai_conversion_task.delay(str(input_path), str(output_path), subject, settings.AI_PROVIDER, api_key, model_name)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown task type: {task_type}")
+
+    task_id = UUID(task_result.id)
+    logger.info(f"Request [{request_id}]: Task dispatched with Celery ID [{task_id}]")
+    return TaskCreated(id=task_id)
 
 
-# --- Placeholder for future API Routers ---
-# In the next steps, we will create routers in the `api/` directory
-# and include them here like this:
-#
-# from .api.v1.api import api_router
-# app.include_router(api_router, prefix=settings.API_V1_STR)
-# --- Include the API Router ---
-# This is the crucial new line.
-# It tells the main app to include all the routes defined in our api_router.
-# The `prefix` ensures that all these routes will start with `/api/v1`.
-app.include_router(api_router, prefix=settings.API_V1_STR)
+@app.get("/api/v1/tasks/status/{task_id}", response_model=TaskStatusResponse, tags=["Conversion Tasks"])
+def get_task_status(task_id: UUID):
+    """Polls for the status of a previously created Celery task."""
+    task_result = AsyncResult(str(task_id), app=celery_app)
+    status = task_result.status.lower()
+    result = None
 
-# To run this application:
-# uvicorn backend.app.main:app --reload
-# To run this application:
-# 1. Make sure you are in the project's root directory (doc_converter_pro).
-# 2. Use the following command in your terminal:
-#    uvicorn backend.app.main:app --reload
+    if task_result.successful():
+        status = "success"
+        task_output = task_result.get()
+        output_path = Path(task_output.get("output_path", ""))
+        result = {
+            "output_file_url": f"/downloads/{task_id}/{output_path.name}",
+            "message": task_output.get("message"),
+            "warnings": task_output.get("warnings", [])
+        }
+    elif task_result.failed():
+        status = "failed"
+        result = {"error_message": str(task_result.info)}
+    elif status in ["pending", "started", "retry"]:
+        status = "in_progress"
+    
+    return TaskStatusResponse(id=task_id, status=status, result=result)

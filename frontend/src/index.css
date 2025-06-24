@@ -1,11 +1,3 @@
-/* frontend/src/index.css */
-
-/* This injects Tailwind's base styles, component classes, and utility classes into your CSS. */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-/* You can add any global custom styles here if needed. */
-body {
-  @apply bg-slate-900 text-slate-100;
-}
