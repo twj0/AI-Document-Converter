@@ -1,4 +1,10 @@
 # backend/services/file_processor.py (The Final, Guaranteed Fix)
+# backend/services/file_processor.py (在文件顶部添加新的导入)
+try:
+    import pypandoc
+    PYPANDOC_AVAILABLE = True
+except (ImportError, OSError): # OSError an be raised if pandoc is not installed
+    PYPANDOC_AVAILABLE = False
 
 import logging
 from pathlib import Path
@@ -132,3 +138,26 @@ def extract_text_smart(input_path: str) -> str:
             return _extract_text_with_ocr(doc).strip() or text.strip()
     else:
         raise FileProcessingError(f"Unsupported file type for text extraction: {file_ext}")
+
+    # 在文件末尾添加这个新函数
+def convert_word_to_markdown_simple(input_path: str, output_path: str) -> None:
+    """
+    Converts a .doc or .docx file to Markdown using Pandoc.
+    """
+    if not PYPANDOC_AVAILABLE:
+        raise RuntimeError(
+            "pypandoc library is not available or the Pandoc application is not installed. "
+            "Please install both to use this feature."
+        )
+    
+    p_in = Path(input_path)
+    p_out = Path(output_path)
+    logger.info(f"Converting '{p_in.name}' to Markdown via Pandoc...")
+
+    try:
+        # 'docx' is the input format for both .doc and .docx for pandoc
+        # It uses Word's text converters internally if available
+        pypandoc.convert_file(str(p_in.resolve()), 'markdown', format='docx', outputfile=str(p_out.resolve()))
+        logger.info(f"Successfully converted to '{p_out.name}' with Pandoc.")
+    except Exception as e:
+        raise FileProcessingError(f"Failed to convert '{p_in.name}' via Pandoc: {e}")
